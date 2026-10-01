@@ -192,7 +192,6 @@ class HookProcessRunner(HookProcessRunnerLifecycleMixin):
         deadline: float | None = None,
         claim_saved_approval: bool = True,
         claimed_saved_allow_hash: str | None = None,
-        claimed_trusted_request_override: bool = False,
         claimed_approval_request_id: str | None = None,
         _transient_not_ready_retries: int = _HOOK_PROCESS_TRANSIENT_NOT_READY_RETRIES,
     ) -> HookProcessReview:
@@ -216,7 +215,6 @@ class HookProcessRunner(HookProcessRunnerLifecycleMixin):
             hook_env=hook_env,
             claim_saved_approval=claim_saved_approval,
             claimed_saved_allow_hash=claimed_saved_allow_hash,
-            claimed_trusted_request_override=claimed_trusted_request_override,
             claimed_approval_request_id=claimed_approval_request_id,
             deadline=review_deadline,
         )
@@ -314,7 +312,6 @@ class HookProcessRunner(HookProcessRunnerLifecycleMixin):
                     deadline=review_deadline,
                     claim_saved_approval=claim_saved_approval,
                     claimed_saved_allow_hash=claimed_saved_allow_hash,
-                    claimed_trusted_request_override=claimed_trusted_request_override,
                     claimed_approval_request_id=claimed_approval_request_id,
                     _transient_not_ready_retries=_transient_not_ready_retries - 1,
                 )
@@ -322,7 +319,7 @@ class HookProcessRunner(HookProcessRunnerLifecycleMixin):
         typed_response = as_string_object_dict(response)
         if typed_response is None:
             return HookProcessReview(None, "daemon_hook_process_invalid_json")
-        self._record_response_metrics(typed_response)
+        self._record_response_metrics(typed_response, envelope_reason_code=reason_code)
         self._record_route_metric(typed_result.get("route"))
         if time.monotonic() >= review_deadline:
             return HookProcessReview(None, "daemon_hook_process_deadline_exhausted")

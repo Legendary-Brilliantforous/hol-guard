@@ -175,10 +175,107 @@ fn envelope_target(payload: &Value) -> Option<String> {
     None
 }
 
-fn sha256_text(text: &str) -> String {
+fn inline_local_content(payload: &Value) -> bool {
+    let Some(input) = payload
+        .get("tool_input")
+        .or_else(|| payload.get("toolInput"))
+    else {
+        return false;
+    };
+    let Some(input) = input.as_object() else {
+        return true;
+    };
+    let may_be_local = |value: &Value| {
+        value
+            .as_str()
+            .map(local_samples_should_be_unsuppressed)
+            .unwrap_or(true)
+    };
+    ["file_path", "path", "filePath"]
+        .iter()
+        .filter_map(|key| input.get(*key))
+        .any(may_be_local)
+        || ["file_paths", "filePaths"]
+            .iter()
+            .filter_map(|key| input.get(*key))
+            .any(|value| {
+                value
+                    .as_array()
+                    .map(|paths| paths.iter().any(may_be_local))
+                    .unwrap_or(true)
+            })
+}
+
+pub fn sha256_text(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn has_output_key(payload: &Value) -> bool {
+    payload
+        .as_object()
+        .is_some_and(|record: &Map<String, Value>| {
+            PAYLOAD_OUTPUT_KEYS
+                .iter()
+                .any(|key| record.contains_key(*key))
+        })
+}
+
+fn allow_inline_output(reason_code: &str, text: &str) -> HookReviewResponseV1 {
+    let mut response = HookReviewResponseV1::allow(reason_code);
+    response.reviewed_output_sha256 = Some(sha256_text(text));
+    response
+}
+
+fn canonical_hex_digest(value: Option<&Value>) -> Option<String> {
+    let text = value?.as_str()?;
+    if text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        // Receipt validation canonicalizes digests to lowercase hex.
+        Some(text.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Canonical proof digest for a post-tool payload: a validated
+/// `guard_source_ref.output_sha256`, then `tool_response_summary.output_sha256`,
+/// then a sha256 over complete inline `tool_response` output. Truncated or
+/// excerpt-only output gets no fabricated proof.
+pub fn canonical_observed_output_sha256(payload: &Value) -> Option<String> {
+    let record = payload.as_object()?;
+    if let Some(digest) = canonical_hex_digest(
+        record
+            .get("guard_source_ref")
+            .and_then(|value| value.get("output_sha256")),
+    ) {
+        return Some(digest);
+    }
+    if let Some(digest) = canonical_hex_digest(
+        record
+            .get("tool_response_summary")
+            .and_then(|value| value.get("output_sha256")),
+    ) {
+        return Some(digest);
+    }
+    // Hash the same output surface `review_inline` scans: every supported
+    // output key, not just `tool_response`. A secret in `stdout`/`stderr` must
+    // still yield a proof digest so observe mode can record the decision.
+    let extracted = extract_payload_output(payload);
+    if extracted.truncated || !has_output_key(payload) {
+        return None;
+    }
+    // A payload that declares excerpted output only proves the excerpt —
+    // never fabricate a digest for truncated output.
+    if record
+        .get("tool_response_summary")
+        .and_then(|value| value.get("excerpt_truncated"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(sha256_text(&extracted.text))
 }
 
 fn output_equivalent(text: &str, output_sha256: &str, output_chars: i64) -> bool {
@@ -335,28 +432,19 @@ fn review_source(
 
 fn review_inline(request: &NativeHookRequestV1) -> HookReviewResponseV1 {
     let extracted = extract_payload_output(&request.payload);
-    let has_output_key = request
-        .payload
-        .as_object()
-        .is_some_and(|record: &Map<String, Value>| {
-            PAYLOAD_OUTPUT_KEYS
-                .iter()
-                .any(|key| record.contains_key(*key))
-        });
     if extracted.text.is_empty() {
         if extracted.truncated {
             return HookReviewResponseV1::deny("output_too_large", "HOL Guard blocked this output because it could not be safely excerpted within local limits.");
         }
-        if has_output_key {
-            return HookReviewResponseV1::allow("output_empty_allow");
+        if has_output_key(&request.payload) {
+            return allow_inline_output("output_empty_allow", &extracted.text);
         }
         return HookReviewResponseV1::deny(
             "no_output_to_review",
             "HOL Guard could not complete local hook review safely.",
         );
     }
-    let local_content = envelope_target(&request.payload)
-        .is_some_and(|path| local_samples_should_be_unsuppressed(&path));
+    let local_content = inline_local_content(&request.payload);
     if extracted.truncated {
         let excerpt: String = extracted
             .text
@@ -394,7 +482,7 @@ fn review_inline(request: &NativeHookRequestV1) -> HookReviewResponseV1 {
             "HOL Guard blocked this output because it contains sensitive content.",
         );
     }
-    HookReviewResponseV1::allow("output_scan_allow")
+    allow_inline_output("output_scan_allow", &extracted.text)
 }
 
 pub fn review_post_tool(request: &NativeHookRequestV1) -> HookReviewResponseV1 {
@@ -417,8 +505,14 @@ pub fn review_post_tool(request: &NativeHookRequestV1) -> HookReviewResponseV1 {
         review_inline(request)
     };
     if request.observe_mode {
-        let output_hash = source.map(|value| value.output_sha256);
-        response.observed(output_hash)
+        let output_hash = canonical_observed_output_sha256(&request.payload);
+        if let Some(output_hash) = output_hash {
+            response.observed(Some(output_hash))
+        } else {
+            // Truncated inline output cannot prove the original bytes. Keep
+            // the fail-closed decision instead of allowing it without proof.
+            response
+        }
     } else {
         response
     }
@@ -462,6 +556,15 @@ mod tests {
         ));
         assert_eq!(response.decision, "allow");
         assert_eq!(response.reason_code, "output_scan_allow");
+        assert_eq!(response.reviewed_output_sha256, Some(sha256_text("hello")));
+    }
+
+    #[test]
+    fn empty_inline_output_is_allowed_with_digest() {
+        let response = review_post_tool(&request(json!({"tool_response": ""})));
+        assert_eq!(response.decision, "allow");
+        assert_eq!(response.reason_code, "output_empty_allow");
+        assert_eq!(response.reviewed_output_sha256, Some(sha256_text("")));
     }
 
     #[test]
@@ -472,10 +575,61 @@ mod tests {
     }
 
     #[test]
+    fn observe_inline_secret_preserves_original_with_digest() {
+        let output = github_like_token();
+        let expected_hash = sha256_text(&output);
+        let mut observe_request = request(json!({"tool_response": output}));
+        observe_request.observe_mode = true;
+
+        let response = review_post_tool(&observe_request);
+
+        assert_eq!(response.decision, "allow");
+        assert_eq!(response.reason_code, "observe_output_secret_match");
+        assert_eq!(response.model_output_action, "allow_original");
+        assert_eq!(response.reviewed_output_sha256, Some(expected_hash));
+        assert_eq!(response.observed_policy_action.as_deref(), Some("block"));
+        assert!(response.observe_mode);
+    }
+
+    #[test]
+    fn observe_truncated_inline_secret_remains_blocked_without_digest() {
+        let output = format!("{}{}", github_like_token(), "x".repeat(MAX_OUTPUT_CHARS));
+        let mut observe_request = request(json!({"tool_response": output}));
+        observe_request.observe_mode = true;
+
+        let response = review_post_tool(&observe_request);
+
+        assert_eq!(response.decision, "deny");
+        assert_eq!(response.reason_code, "output_too_large");
+        assert_eq!(response.reviewed_output_sha256, None);
+        assert!(!response.observe_mode);
+    }
+
+    #[test]
     fn stderr_is_scanned_even_when_stdout_exists() {
         let response = review_post_tool(&request(
             json!({"stdout": "ok", "stderr": aws_like_access_key()}),
         ));
         assert_eq!(response.reason_code, "output_secret_match");
+    }
+
+    #[test]
+    fn mixed_documentation_and_source_paths_unsuppress_credential() {
+        let response = review_post_tool(&request(json!({
+            "tool_input": {"file_paths": ["docs/security-review.md", "src/config.py"]},
+            "tool_response": [{"type": "text", "text": "credential = 'fixture-only'\n"}]
+        })));
+        assert_eq!(response.decision, "deny");
+        assert_eq!(response.reason_code, "output_secret_match");
+    }
+
+    #[test]
+    fn documentation_only_multi_paths_keep_fixture_suppression() {
+        let response = review_post_tool(&request(json!({
+            "tool_input": {"file_paths": ["docs/security-review.md", "tests/fixture.txt"]},
+            "tool_response": [{"type": "text", "text": "credential = 'fixture-only'\n"}]
+        })));
+        assert_eq!(response.decision, "allow");
+        assert_eq!(response.reason_code, "output_scan_allow");
     }
 }
